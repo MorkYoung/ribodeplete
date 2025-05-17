@@ -7,100 +7,161 @@ from Bio.Seq import Seq
 from Bio import SeqIO
 import os,subprocess
 import ribodeplete as rd
+import multiprocess as mp
+from tqdm import tqdm
 
 # define single functions
 
 def optimizeprobes(fasta_path=None, n_probes=25, probe_mutation_steps=25, optimization_cycles=10,
                    target_tm=62.5, tm_dist=norm, tm_dist_kwargs={'loc':62.5,'scale':2,},
-                   probe_start_len=(15,25), show_plots=False):
-    # generate alignment object from aligned fasta file
+                   probe_start_len=(15,25), show_plots=False, force_coverage=False, chunk_size=200):
     align_obj = rd.AlignedrRNA(fasta_path)
+    align_objs = [align_obj]
+    if force_coverage:
+        # chunk up the alignment 
+        temp_dir = os.path.join(os.path.dirname(fasta_path), 'temp')
+        os.makedirs(temp_dir, exist_ok=True)
+        with open(fasta_path, 'r') as f:
+            lines = f.read().strip().split('\n')
+        seqs = {}
+        curr = None
+        for l in lines:
+            if l.startswith('>'):
+                curr = l
+                seqs[curr] = ''
+            else:
+                seqs[curr] += l.strip()
+        total_len = len(seqs[list(seqs.keys())[0]])
+        for i in range(int(total_len / chunk_size)):
+            if i == int(total_len / chunk_size) - 1:
+                end = total_len
+            else:
+                end = (i+1)*chunk_size
+            fname = os.path.join(temp_dir, 'chunk_%d.fasta' % i)
+            with open(fname, 'w') as f:
+                for k,v in seqs.items():
+                    if len([x for x in v[i*chunk_size:end] if x != '-']) > chunk_size*.9:
+                        f.write('%s\n%s\n' % (k, '-'*i*chunk_size + v[i*chunk_size:end]))
+        align_objs = [rd.AlignedrRNA(os.path.join(temp_dir, fname)) for fname in os.listdir(temp_dir)]
+
     # generate probes
-    probes_left = n_probes
-    while probes_left != 0:
-        try:
-            probe_length = np.random.randint(probe_start_len[0], probe_start_len[1]+1) # randomly determine probe length between parameters
-            probe_start  = np.random.randint(len(align_obj.rrna[0])-probe_length) # randomly decide on a probe position (may not be successful if crosses an unaligned region)
-            align_obj.addProbe(probe_start, probe_length, template='chimera') # add probes, will through error if unsuccessful
-            probes_left-=1 # probe successfully added, tick forward
-        except ValueError:
-            pass # probe threw a value error, try again
-    # generate the distribution for probe picks
-    distribution_function = tm_dist(**tm_dist_kwargs)
-    # start optimization cycles
-    cycle_number = 0 # set to 0 initially for storage of original probe positions etc
-    if show_plots is not False:
-        if cycle_number in show_plots:
-            align_obj.snapshotProbes()
-    # store probe Tms
-    align_obj.snapshotProbeTms()
-    while cycle_number < optimization_cycles: # track number of cycles
-        for probe_i in np.arange(len(align_obj.probes)):
-            # now diversify given probe
-            new_probes = align_obj.diversifyProbe(probe_i, probe_mutation_steps)
-            new_tm = np.asarray([np.min(p.getTm()) for p in new_probes])
-            if np.all(np.isnan(new_tm)): # if all Tms are undefined
-                picked_probe = new_probes[np.random.choice(np.arange(len(new_probes)))] # just pick a random primer
-            else: # if one or more of them has a real Tm, use the distribution to pick best(ish) primer
-                pdf_outputs = distribution_function.pdf(new_tm)
-                pdf_outputs[np.isnan(pdf_outputs)] = 0
-                # if all probabilities end up being zero (some things are too far from the pdf), pick closest to the target tm
-                if all(pdf_outputs == 0):
-                    picked_probe = new_probes[np.argmin(np.abs(target_tm - new_tm))]
-                else:
-                    picked_probe = new_probes[np.random.choice(np.arange(len(pdf_outputs)), p=pdf_outputs / np.sum(pdf_outputs))]
-            align_obj.probes[probe_i] = picked_probe
-        cycle_number += 1 # optimization cycle completed, tick up by 1
+    n_probes = round(n_probes / len(align_objs))
+    def process_alignment(align_obj):
+        probes_left = n_probes
+        while probes_left != 0:
+            try:
+                probe_length = np.random.randint(probe_start_len[0], probe_start_len[1]+1) # randomly determine probe length between parameters
+                probe_start  = np.random.randint(len(align_obj.rrna[0])-probe_length) # randomly decide on a probe position (may not be successful if crosses an unaligned region)
+                align_obj.addProbe(probe_start, probe_length, template='chimera') # add probes, will through error if unsuccessful
+                probes_left-=1 # probe successfully added, tick forward
+            except ValueError:
+                pass # probe threw a value error, try again
+        # generate the distribution for probe picks
+        distribution_function = tm_dist(**tm_dist_kwargs)
+        # start optimization cycles
+        cycle_number = 0 # set to 0 initially for storage of original probe positions etc
         if show_plots is not False:
             if cycle_number in show_plots:
                 align_obj.snapshotProbes()
         # store probe Tms
         align_obj.snapshotProbeTms()
+        while cycle_number < optimization_cycles: # track number of cycles
+            for probe_i in np.arange(len(align_obj.probes)):
+                # now diversify given probe
+                new_probes = align_obj.diversifyProbe(probe_i, probe_mutation_steps)
+                new_tm = np.asarray([np.min(p.getTm()) for p in new_probes])
+                if np.all(np.isnan(new_tm)): # if all Tms are undefined
+                    picked_probe = new_probes[np.random.choice(np.arange(len(new_probes)))] # just pick a random primer
+                else: # if one or more of them has a real Tm, use the distribution to pick best(ish) primer
+                    pdf_outputs = distribution_function.pdf(new_tm)
+                    pdf_outputs[np.isnan(pdf_outputs)] = 0
+                    # if all probabilities end up being zero (some things are too far from the pdf), pick closest to the target tm
+                    if all(pdf_outputs == 0):
+                        picked_probe = new_probes[np.argmin(np.abs(target_tm - new_tm))]
+                    else:
+                        picked_probe = new_probes[np.random.choice(np.arange(len(pdf_outputs)), p=pdf_outputs / np.sum(pdf_outputs))]
+                align_obj.probes[probe_i] = picked_probe
+            cycle_number += 1 # optimization cycle completed, tick up by 1
+            if show_plots is not False:
+                if cycle_number in show_plots:
+                    align_obj.snapshotProbes()
+            # store probe Tms
+            align_obj.snapshotProbeTms()
+        return align_obj
+    if len(align_objs) > 1:
+        with mp.Pool(mp.cpu_count()) as pool:
+            align_objs = list(tqdm(pool.imap(process_alignment, align_objs), total=len(align_objs)))
+        ## merge probes!
+        for i in range(len(align_objs)):
+            plus = i*chunk_size
+            # probes 
+            for probe in align_objs[i].probes:
+                align_obj.probes.append(probe)
+        # probe_plot_snapshots
+        align_obj.probe_plot_snapshots = align_objs[0].probe_plot_snapshots
+        for i in range(1, len(align_objs)):
+            for j in range(len(align_objs[i].probe_plot_snapshots)):
+                align_obj.probe_plot_snapshots[j] = np.concatenate([align_obj.probe_plot_snapshots[j], 
+                                        align_objs[i].probe_plot_snapshots[j]])
+
+        # probe_tm_snapshots 
+        align_obj.probe_tm_snapshots = align_objs[0].probe_tm_snapshots
+        for i in range(1, len(align_objs)):
+            for j in range(len(align_objs[i].probe_tm_snapshots)):
+                align_obj.probe_tm_snapshots[j] = np.concatenate([align_obj.probe_tm_snapshots[j], 
+                                        align_objs[i].probe_tm_snapshots[j]])
+    else:
+        align_obj = process_alignment(align_objs[0])
     return align_obj
 
 def extractrrna(genbank_path, species_label, verbose = False, additional_nt = 0):
-    genome = SeqIO.read(genbank_path, 'genbank')
+    # switch to using parse to support multiple contigs
+    genomes = SeqIO.parse(genbank_path, 'genbank')
     # in order: 16S, 23S, 5S
     output_names = [[],[],[]]
     output_sequences = [[],[],[]]
     n_sequences = [0,0,0]
     n_duplicate = [0,0,0]
-    for feat in genome.features:
-        if feat.type == 'rRNA':
-            # extract gene sequence
-            gene_sequence = genome.seq[feat.location.start-additional_nt:feat.location.end+additional_nt]
-            if str(feat.strand) == '-1':
-                gene_sequence = gene_sequence.reverse_complement()
-            gene_sequence = str(gene_sequence)
-            try: # generate a gene name from either the 'gene' or 'locus_tag' qualifier
-                gene_name = '%s_%s'%(species_label, feat.qualifiers['gene'][0])
-            except KeyError:
-                gene_name = '%s_%s'%(species_label, feat.qualifiers['locus_tag'][0])
-            # determine which list to append it to, append it to the list
-            gene_product = (feat.qualifiers['product'][0]).lower()
-            for i,rrna_type in enumerate(['16s','23s','5s']):
-                if rrna_type in gene_product: # try to add to the proper list
-                    n_sequences[i] += 1
-                    if gene_sequence in output_sequences[i]: # if exact sequence already exists, don't add a duplicate
-                        n_duplicate[i] += 1
+    for genome in genomes:
+        for feat in genome.features:
+            if feat.type == 'rRNA':
+                # extract gene sequence
+                gene_sequence = genome.seq[feat.location.start-additional_nt:feat.location.end+additional_nt]
+                if str(feat.location.strand) == '-1':
+                    gene_sequence = gene_sequence.reverse_complement()
+                gene_sequence = str(gene_sequence)
+                try: # generate a gene name from either the 'gene' or 'locus_tag' qualifier
+                    gene_name = '%s_%s'%(species_label, feat.qualifiers['gene'][0])
+                except KeyError:
+                    try:
+                        gene_name = '%s_%s'%(species_label, feat.qualifiers['locus_tag'][0])
+                    except KeyError:
+                        gene_name = '%s_%s'%(species_label, feat.qualifiers['db_xref'][0])
+                # determine which list to append it to, append it to the list
+                gene_product = (feat.qualifiers['product'][0]).lower()
+                for i,rrna_type in enumerate(['16s','23s','5s']):
+                    if rrna_type in gene_product: # try to add to the proper list
+                        n_sequences[i] += 1
+                        if gene_sequence in output_sequences[i]: # if exact sequence already exists, don't add a duplicate
+                            n_duplicate[i] += 1
+                            break
+                        output_sequences[i].append(gene_sequence)
+                        if gene_name in output_names[i]:
+                            name_increment = 1
+                            while True:
+                                if gene_name+str(name_increment) in output_names[i]:
+                                    name_increment+=1
+                                else:
+                                    break
+                            output_names[i].append(gene_name+str(name_increment))
+                        else:
+                            output_names[i].append(gene_name)
                         break
-                    output_sequences[i].append(gene_sequence)
-                    if gene_name in output_names[i]:
-                        name_increment = 1
-                        while True:
-                            if gene_name+str(name_increment) in output_names[i]:
-                                name_increment+=1
-                            else:
-                                break
-                        output_names[i].append(gene_name+str(name_increment))
-                    else:
-                        output_names[i].append(gene_name)
-                    break
-            else:
-                raise TypeError('Gene product %s is not a recognized rRNA type!'%gene_product)
-    if verbose: # print summary information about genome
-        # description, number of each type of loci found
-        print('%s\nnumber of loci: %i/%i/%i (16S/23S/5S)\nduplicate: %i/%i/%i'%(genome.description,
+                else:
+                    raise TypeError('Gene product %s is not a recognized rRNA type!'%gene_product)
+        if verbose: # print summary information about genome
+            # description, number of each type of loci found
+            print('%s\nnumber of loci: %i/%i/%i (16S/23S/5S)\nduplicate: %i/%i/%i'%(genome.description,
                                                                             n_sequences[0],n_sequences[1],n_sequences[2],
                                                                             n_duplicate[0],n_duplicate[1],n_duplicate[2]))
     return output_names, output_sequences
@@ -119,6 +180,7 @@ def alignrRNA(genome_paths, verbose = False):
     output_names = []
     output_sequences = []
     for i in range(3):
+        print(input_names[i])
         names, sequences = muscleAlign(input_names[i],input_sequences[i])
         output_names.append(names)
         output_sequences.append(sequences)
@@ -128,7 +190,8 @@ def muscleAlign(names, sequences):
     # write a temporary fasta file for muscle to read / align
     writeFasta('_temp.fasta', names, sequences)
     # conduct a muscle alignment on the temporary fasta
-    subprocess.call(['muscle','-in','_temp.fasta','-out','_temp_aligned.fasta'])
+    #updated muscle command for modern era 
+    subprocess.call(['muscle','-align','_temp.fasta','-output','_temp_aligned.fasta'])
     # import alignments back into python
     names, sequences = readFasta('_temp_aligned.fasta',True)
     # clean up temporary file
